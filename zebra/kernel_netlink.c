@@ -26,6 +26,7 @@
 #include "lib_errors.h"
 #include "hash.h"
 #include "lib/netlink_parser.h"
+#include "lib/frr_pthread.h"
 
 #include "zebra/zebra_router.h"
 #include "zebra/zebra_ns.h"
@@ -1874,6 +1875,51 @@ static void kernel_nlsock_fini(struct nlsock *nls)
 	}
 }
 
+/* Request to clean up an nlsock in the dplane pthread */
+struct nlsock_dplane_fini {
+	struct nlsock *nls;
+	bool done;
+};
+
+static pthread_mutex_t nlsock_dplane_fini_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t nlsock_dplane_fini_cond = PTHREAD_COND_INITIALIZER;
+
+static void kernel_nlsock_dplane_fini_event(struct event *event)
+{
+	struct nlsock_dplane_fini *req = EVENT_ARG(event);
+
+	kernel_nlsock_fini(req->nls);
+
+	frr_with_mutex (&nlsock_dplane_fini_mutex) {
+		req->done = true;
+		pthread_cond_signal(&nlsock_dplane_fini_cond);
+	}
+}
+
+/*
+ * The dplane pthread may be sending a batch on the outbound dataplane
+ * socket, and the zns that holds the socket may be freed as soon as we
+ * return. Clean the socket up in the dplane pthread, between its tasks,
+ * and wait for that to finish.
+ */
+static void kernel_nlsock_dplane_fini(struct nlsock *nls)
+{
+	struct event_loop *dplane_master = dplane_get_thread_master();
+	struct nlsock_dplane_fini req = { .nls = nls };
+
+	if (!dplane_master) {
+		kernel_nlsock_fini(nls);
+		return;
+	}
+
+	event_add_event(dplane_master, kernel_nlsock_dplane_fini_event, &req, 0, NULL);
+
+	frr_with_mutex (&nlsock_dplane_fini_mutex) {
+		while (!req.done)
+			pthread_cond_wait(&nlsock_dplane_fini_cond, &nlsock_dplane_fini_mutex);
+	}
+}
+
 void kernel_terminate(struct zebra_ns *zns, bool complete)
 {
 	kernel_nlsock_fini(&zns->netlink_cmd);
@@ -1886,7 +1932,7 @@ void kernel_terminate(struct zebra_ns *zns, bool complete)
 	 * around until all work is done.
 	 */
 	if (complete)
-		kernel_nlsock_fini(&zns->netlink_dplane_out);
+		kernel_nlsock_dplane_fini(&zns->netlink_dplane_out);
 }
 
 /*
